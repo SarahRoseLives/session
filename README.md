@@ -36,6 +36,14 @@ Current behavior:
 
 ## Install
 
+One-line install to `/usr/local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SarahRoseLives/session/main/install.sh | sh
+```
+
+The installer builds the latest `main` branch and places the binary at `/usr/local/bin/session`. It requires `curl`, `tar`, and `go`. If `/usr/local/bin` is not writable, it will use `sudo`.
+
 Build it locally:
 
 ```bash
