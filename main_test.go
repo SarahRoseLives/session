@@ -160,7 +160,62 @@ func TestReplayTranscriptWritesClearAndLogContents(t *testing.T) {
 		t.Fatalf("replay transcript: %v", err)
 	}
 
-	if got, want := output.String(), "\x1b[H\x1b[2Jhello\nworld\n"; got != want {
+	if got, want := output.String(), "\x1b[2;1H\x1b[Jhello\nworld\n"; got != want {
 		t.Fatalf("replay output = %q, want %q", got, want)
+	}
+}
+
+func TestDetachParserRecognizesCtrlBThenD(t *testing.T) {
+	parser := detachParser{}
+
+	output, detach := parser.parse([]byte{detachPrefix, 'd'})
+	if detach != true {
+		t.Fatal("expected detach to be true")
+	}
+	if len(output) != 0 {
+		t.Fatalf("output = %v, want empty", output)
+	}
+}
+
+func TestDetachParserForwardsOtherCtrlBSequences(t *testing.T) {
+	parser := detachParser{}
+
+	output, detach := parser.parse([]byte{detachPrefix, 'x'})
+	if detach {
+		t.Fatal("did not expect detach")
+	}
+	if got, want := string(output), string([]byte{detachPrefix, 'x'}); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestRenderSessionHeaderIncludesTitleAndHint(t *testing.T) {
+	got := renderSessionHeader("workbench", 40)
+	if !bytes.Contains([]byte(got), []byte("Session - workbench")) {
+		t.Fatalf("header = %q, missing title", got)
+	}
+	if !bytes.Contains([]byte(got), []byte("Ctrl-B d detach")) {
+		t.Fatalf("header = %q, missing detach hint", got)
+	}
+}
+
+func TestContentRowsReservesHeaderLine(t *testing.T) {
+	if got := contentRows(24); got != 23 {
+		t.Fatalf("content rows = %d, want %d", got, 23)
+	}
+	if got := contentRows(1); got != 1 {
+		t.Fatalf("content rows = %d, want %d", got, 1)
+	}
+}
+
+func TestSessionChromeWriterDetectsClearSequenceAcrossWrites(t *testing.T) {
+	writer := newSessionChromeWriter(&bytes.Buffer{}, "workbench")
+
+	if writer.needsRedraw([]byte("hello")) {
+		t.Fatal("did not expect redraw for plain text")
+	}
+	writer.rememberTail([]byte("\x1b[H"))
+	if !writer.needsRedraw([]byte("\x1b[2J")) {
+		t.Fatal("expected redraw when clear sequence completes across writes")
 	}
 }

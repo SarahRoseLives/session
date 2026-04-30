@@ -46,6 +46,8 @@ type daemonServer struct {
 	signalPGRP   func(int) error
 }
 
+var errDetached = errors.New("detached from session")
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "session:", err)
@@ -145,7 +147,7 @@ func runNewSession(store *session.Store, cfg config) error {
 	} else {
 		fmt.Fprintf(os.Stderr, "session: %s\n", id)
 	}
-	return runClient(socketPath, store.LogPath(id))
+	return runClient(socketPath, store.LogPath(id), clientSessionTitle(cfg.sessionName, id))
 }
 
 func startDaemon(id, shell, sessionName string) error {
@@ -198,7 +200,7 @@ func runResume(store *session.Store) error {
 		return err
 	}
 
-	return runClient(selected.SocketPath, selected.LogPath)
+	return runClient(selected.SocketPath, selected.LogPath, sessionLabel(selected))
 }
 
 func printSessions(store *session.Store, w io.Writer) error {
@@ -235,7 +237,7 @@ func printSessionList(sessions []session.Metadata, w io.Writer) error {
 	return nil
 }
 
-func runClient(socketPath, logPath string) error {
+func runClient(socketPath, logPath, title string) error {
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
 		return errors.New("session requires a terminal for interactive sessions")
 	}
@@ -251,6 +253,11 @@ func runClient(socketPath, logPath string) error {
 		return err
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	defer teardownSessionChrome(os.Stdout)
+
+	if err := setupSessionChrome(os.Stdout, title); err != nil {
+		return err
+	}
 
 	if err := replayTranscript(os.Stdout, logPath); err != nil {
 		return err
@@ -263,13 +270,13 @@ func runClient(socketPath, logPath string) error {
 		return session.WriteFrame(conn, kind, payload)
 	}
 
-	if err := sendCurrentSize(send); err != nil {
+	if err := sendCurrentSize(send, os.Stdout, title); err != nil {
 		return err
 	}
 
 	stopResize := make(chan struct{})
 	defer close(stopResize)
-	if err := forwardResizes(send, stopResize); err != nil {
+	if err := forwardResizes(send, stopResize, os.Stdout, title); err != nil {
 		return err
 	}
 
@@ -278,10 +285,10 @@ func runClient(socketPath, logPath string) error {
 		inputErr <- forwardInput(conn, send)
 	}()
 
-	_, copyErr := io.Copy(os.Stdout, conn)
+	_, copyErr := io.Copy(newSessionChromeWriter(os.Stdout, title), conn)
 	_ = conn.Close()
 
-	if inErr := <-inputErr; inErr != nil && !errors.Is(inErr, net.ErrClosed) {
+	if inErr := <-inputErr; inErr != nil && !errors.Is(inErr, net.ErrClosed) && !errors.Is(inErr, errDetached) {
 		return inErr
 	}
 	if copyErr != nil && !errors.Is(copyErr, net.ErrClosed) && !errors.Is(copyErr, io.EOF) {
@@ -305,7 +312,7 @@ func replayTranscript(w io.Writer, logPath string) error {
 	}
 	defer logFile.Close()
 
-	if _, err := io.WriteString(w, "\x1b[H\x1b[2J"); err != nil {
+	if _, err := io.WriteString(w, "\x1b[2;1H\x1b[J"); err != nil {
 		return err
 	}
 
@@ -315,18 +322,30 @@ func replayTranscript(w io.Writer, logPath string) error {
 
 func forwardInput(conn net.Conn, send func(byte, []byte) error) error {
 	buffer := make([]byte, 4096)
+	parser := detachParser{}
 	for {
 		n, err := os.Stdin.Read(buffer)
 		if n > 0 {
-			chunk := append([]byte(nil), buffer[:n]...)
-			if writeErr := send(session.FrameInput, chunk); writeErr != nil {
-				return writeErr
+			chunk, detach := parser.parse(buffer[:n])
+			if len(chunk) > 0 {
+				if writeErr := send(session.FrameInput, append([]byte(nil), chunk...)); writeErr != nil {
+					return writeErr
+				}
+			}
+			if detach {
+				_ = conn.Close()
+				return errDetached
 			}
 		}
 		if err == nil {
 			continue
 		}
 		if errors.Is(err, io.EOF) {
+			if parser.pending {
+				if writeErr := send(session.FrameInput, []byte{detachPrefix}); writeErr != nil {
+					return writeErr
+				}
+			}
 			if unixConn, ok := conn.(*net.UnixConn); ok {
 				return unixConn.CloseWrite()
 			}
@@ -336,7 +355,36 @@ func forwardInput(conn net.Conn, send func(byte, []byte) error) error {
 	}
 }
 
-func forwardResizes(send func(byte, []byte) error, stop <-chan struct{}) error {
+const detachPrefix = byte(0x02)
+
+type detachParser struct {
+	pending bool
+}
+
+func (p *detachParser) parse(input []byte) ([]byte, bool) {
+	output := make([]byte, 0, len(input))
+	for _, current := range input {
+		if p.pending {
+			p.pending = false
+			if current == 'd' || current == 'D' {
+				return output, true
+			}
+			output = append(output, detachPrefix, current)
+			continue
+		}
+
+		if current == detachPrefix {
+			p.pending = true
+			continue
+		}
+
+		output = append(output, current)
+	}
+
+	return output, false
+}
+
+func forwardResizes(send func(byte, []byte) error, stop <-chan struct{}, w io.Writer, title string) error {
 	resizeSignals := make(chan os.Signal, 1)
 	signal.Notify(resizeSignals, syscall.SIGWINCH)
 
@@ -347,7 +395,7 @@ func forwardResizes(send func(byte, []byte) error, stop <-chan struct{}) error {
 			case <-stop:
 				return
 			case <-resizeSignals:
-				_ = sendCurrentSize(send)
+				_ = sendCurrentSize(send, w, title)
 			}
 		}
 	}()
@@ -355,13 +403,127 @@ func forwardResizes(send func(byte, []byte) error, stop <-chan struct{}) error {
 	return nil
 }
 
-func sendCurrentSize(send func(byte, []byte) error) error {
+func sendCurrentSize(send func(byte, []byte) error, w io.Writer, title string) error {
 	cols, rows, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
 		return err
 	}
 
-	return send(session.FrameResize, session.EncodeResize(rows, cols))
+	if err := setupSessionChrome(w, title); err != nil {
+		return err
+	}
+
+	return send(session.FrameResize, session.EncodeResize(contentRows(rows), cols))
+}
+
+func setupSessionChrome(w io.Writer, title string) error {
+	cols, rows, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		return err
+	}
+
+	header := renderSessionHeader(title, cols)
+	if rows <= 1 {
+		_, err = io.WriteString(w, "\x1b[H\x1b[2K"+header)
+		return err
+	}
+
+	_, err = io.WriteString(w, "\x1b[?6h\x1b[H\x1b[2K"+header+fmt.Sprintf("\x1b[2;%dr\x1b[2;1H", rows))
+	return err
+}
+
+func teardownSessionChrome(w io.Writer) {
+	_, _ = io.WriteString(w, "\x1b[r\x1b[?6l\x1b[0m")
+}
+
+func renderSessionHeader(title string, cols int) string {
+	if cols <= 0 {
+		cols = 80
+	}
+
+	main := truncateRunes(" Session - "+strings.TrimSpace(title), cols)
+	hint := "Ctrl-B d detach"
+	if cols > len(hint)+4 && len([]rune(main))+len(hint)+1 <= cols {
+		main = padRight(main, cols-len(hint)) + hint
+	} else {
+		main = padRight(main, cols)
+	}
+
+	return "\x1b[7m" + padRight(main, cols) + "\x1b[0m"
+}
+
+func truncateRunes(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	if width == 1 {
+		return string(runes[:1])
+	}
+	return string(runes[:width-1]) + "…"
+}
+
+func padRight(value string, width int) string {
+	runes := []rune(value)
+	if len(runes) >= width {
+		return string(runes[:width])
+	}
+	return value + strings.Repeat(" ", width-len(runes))
+}
+
+func contentRows(rows int) int {
+	if rows <= 1 {
+		return 1
+	}
+	return rows - 1
+}
+
+func clientSessionTitle(name, id string) string {
+	if strings.TrimSpace(name) != "" {
+		return name
+	}
+	return id
+}
+
+type sessionChromeWriter struct {
+	out   io.Writer
+	title string
+	tail  string
+}
+
+func newSessionChromeWriter(out io.Writer, title string) *sessionChromeWriter {
+	return &sessionChromeWriter{out: out, title: title}
+}
+
+func (w *sessionChromeWriter) Write(p []byte) (int, error) {
+	n, err := w.out.Write(p)
+	if n > 0 {
+		if w.needsRedraw(p[:n]) {
+			if redrawErr := setupSessionChrome(w.out, w.title); redrawErr != nil && err == nil {
+				err = redrawErr
+			}
+		}
+		w.rememberTail(p[:n])
+	}
+	return n, err
+}
+
+func (w *sessionChromeWriter) needsRedraw(chunk []byte) bool {
+	combined := w.tail + string(chunk)
+	return strings.Contains(combined, "\x1b[2J") ||
+		strings.Contains(combined, "\x1bc") ||
+		strings.Contains(combined, "\x1b[H\x1b[J")
+}
+
+func (w *sessionChromeWriter) rememberTail(chunk []byte) {
+	combined := w.tail + string(chunk)
+	if len(combined) > 16 {
+		combined = combined[len(combined)-16:]
+	}
+	w.tail = combined
 }
 
 func waitForSocket(socketPath string, timeout time.Duration) error {

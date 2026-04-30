@@ -16,6 +16,8 @@ Unlike `screen`, this project stays focused on **session persistence and quick r
 - **Resume picker** built with Bubble Tea
 - **Newest-first session list**
 - **Named sessions** with `--name`
+- **Detach shortcut** with `Ctrl-B` then `d`
+- **Session bar** at the top of attached terminals
 - **Live session details** in the list and resume UI:
   - session name
   - current working directory
@@ -82,6 +84,10 @@ Open the interactive resume picker:
 session --resume
 ```
 
+Detach from an attached session without stopping it:
+
+- press **Ctrl-B** then **d**
+
 ## Resume UI
 
 The `--resume` screen supports:
@@ -91,6 +97,18 @@ The `--resume` screen supports:
 - **q** or **esc** to cancel
 
 It adapts to smaller terminals by switching to a compact layout and trimming long values.
+
+## Demo
+
+An asciinema recording is included in the repo:
+
+- [session.cast](./session.cast)
+
+You can play it locally with:
+
+```bash
+asciinema play session.cast
+```
 
 ## How it works
 
