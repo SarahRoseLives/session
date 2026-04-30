@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -63,5 +66,101 @@ func TestApplyResizeStopsOnResizeError(t *testing.T) {
 
 	if err := server.applyResize(40, 120); err == nil {
 		t.Fatal("expected applyResize to return an error")
+	}
+}
+
+func TestNotifyWindowChangeUsesForegroundProcessGroup(t *testing.T) {
+	server := &daemonServer{}
+
+	var gotPGRP int
+	server.getPGRP = func() (int, error) {
+		return 4321, nil
+	}
+	server.signalPGRP = func(processGroupID int) error {
+		gotPGRP = processGroupID
+		return nil
+	}
+
+	if err := server.notifyWindowChange(); err != nil {
+		t.Fatalf("notify window change: %v", err)
+	}
+	if gotPGRP != 4321 {
+		t.Fatalf("process group = %d, want %d", gotPGRP, 4321)
+	}
+}
+
+func TestApplyInitialResizeForcesRedrawWhenSizeMatches(t *testing.T) {
+	server := &daemonServer{}
+
+	server.getPTYSize = func() (int, int, error) {
+		return 40, 120, nil
+	}
+
+	var sizes [][2]int
+	server.setPTYSize = func(rows, cols int) error {
+		sizes = append(sizes, [2]int{rows, cols})
+		return nil
+	}
+
+	var signalCalls int
+	server.windowChange = func() error {
+		signalCalls++
+		return nil
+	}
+
+	if err := server.applyInitialResize(40, 120); err != nil {
+		t.Fatalf("apply initial resize: %v", err)
+	}
+
+	if len(sizes) != 2 {
+		t.Fatalf("resize calls = %d, want 2", len(sizes))
+	}
+	if sizes[0] == sizes[1] {
+		t.Fatalf("forced resize did not change size: %v", sizes)
+	}
+	if sizes[1] != [2]int{40, 120} {
+		t.Fatalf("final resize = %v, want %v", sizes[1], [2]int{40, 120})
+	}
+	if signalCalls != 1 {
+		t.Fatalf("signal calls = %d, want 1", signalCalls)
+	}
+}
+
+func TestApplyInitialResizeSkipsForcedCycleWhenSizeDiffers(t *testing.T) {
+	server := &daemonServer{}
+
+	server.getPTYSize = func() (int, int, error) {
+		return 24, 80, nil
+	}
+
+	var sizes [][2]int
+	server.setPTYSize = func(rows, cols int) error {
+		sizes = append(sizes, [2]int{rows, cols})
+		return nil
+	}
+	server.windowChange = func() error { return nil }
+
+	if err := server.applyInitialResize(40, 120); err != nil {
+		t.Fatalf("apply initial resize: %v", err)
+	}
+
+	if len(sizes) != 1 || sizes[0] != [2]int{40, 120} {
+		t.Fatalf("resize calls = %v, want only final target", sizes)
+	}
+}
+
+func TestReplayTranscriptWritesClearAndLogContents(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "session.log")
+	if err := os.WriteFile(logPath, []byte("hello\nworld\n"), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	var output bytes.Buffer
+	if err := replayTranscript(&output, logPath); err != nil {
+		t.Fatalf("replay transcript: %v", err)
+	}
+
+	if got, want := output.String(), "\x1b[H\x1b[2Jhello\nworld\n"; got != want {
+		t.Fatalf("replay output = %q, want %q", got, want)
 	}
 }

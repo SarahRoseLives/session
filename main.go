@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 
 	"session/internal/session"
@@ -38,8 +39,11 @@ type daemonServer struct {
 
 	mu           sync.Mutex
 	client       net.Conn
+	getPTYSize   func() (rows, cols int, err error)
 	setPTYSize   func(rows, cols int) error
 	windowChange func() error
+	getPGRP      func() (int, error)
+	signalPGRP   func(int) error
 }
 
 func main() {
@@ -141,7 +145,7 @@ func runNewSession(store *session.Store, cfg config) error {
 	} else {
 		fmt.Fprintf(os.Stderr, "session: %s\n", id)
 	}
-	return runClient(socketPath)
+	return runClient(socketPath, store.LogPath(id))
 }
 
 func startDaemon(id, shell, sessionName string) error {
@@ -194,7 +198,7 @@ func runResume(store *session.Store) error {
 		return err
 	}
 
-	return runClient(selected.SocketPath)
+	return runClient(selected.SocketPath, selected.LogPath)
 }
 
 func printSessions(store *session.Store, w io.Writer) error {
@@ -231,7 +235,7 @@ func printSessionList(sessions []session.Metadata, w io.Writer) error {
 	return nil
 }
 
-func runClient(socketPath string) error {
+func runClient(socketPath, logPath string) error {
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
 		return errors.New("session requires a terminal for interactive sessions")
 	}
@@ -247,6 +251,10 @@ func runClient(socketPath string) error {
 		return err
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	if err := replayTranscript(os.Stdout, logPath); err != nil {
+		return err
+	}
 
 	var writeMu sync.Mutex
 	send := func(kind byte, payload []byte) error {
@@ -281,6 +289,28 @@ func runClient(socketPath string) error {
 	}
 
 	return nil
+}
+
+func replayTranscript(w io.Writer, logPath string) error {
+	if strings.TrimSpace(logPath) == "" {
+		return nil
+	}
+
+	logFile, err := os.Open(logPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer logFile.Close()
+
+	if _, err := io.WriteString(w, "\x1b[H\x1b[2J"); err != nil {
+		return err
+	}
+
+	_, err = io.Copy(w, logFile)
+	return err
 }
 
 func forwardInput(conn net.Conn, send func(byte, []byte) error) error {
@@ -503,6 +533,7 @@ func (d *daemonServer) handleClient(conn net.Conn) (err error) {
 		_ = conn.Close()
 	}()
 
+	firstResize := true
 	for {
 		frameType, payload, err := session.ReadFrame(conn)
 		if err != nil {
@@ -521,6 +552,14 @@ func (d *daemonServer) handleClient(conn net.Conn) (err error) {
 			rows, cols, err := session.DecodeResize(payload)
 			if err != nil {
 				return err
+			}
+
+			if firstResize {
+				firstResize = false
+				if err := d.applyInitialResize(rows, cols); err != nil {
+					return err
+				}
+				continue
 			}
 
 			if err := d.applyResize(rows, cols); err != nil {
@@ -551,11 +590,48 @@ func (d *daemonServer) claimClient(conn net.Conn) error {
 	return nil
 }
 
+func (d *daemonServer) applyInitialResize(rows, cols int) error {
+	currentRows, currentCols, err := d.currentPTYSize()
+	if err != nil {
+		return d.applyResize(rows, cols)
+	}
+
+	if currentRows != rows || currentCols != cols {
+		return d.applyResize(rows, cols)
+	}
+
+	alternateRows, alternateCols := rows, cols
+	if cols < 0xffff {
+		alternateCols++
+	} else if cols > 1 {
+		alternateCols--
+	} else if rows < 0xffff {
+		alternateRows++
+	} else if rows > 1 {
+		alternateRows--
+	}
+
+	if alternateRows != rows || alternateCols != cols {
+		if err := d.resizePTY(alternateRows, alternateCols); err != nil {
+			return err
+		}
+	}
+
+	return d.applyResize(rows, cols)
+}
+
 func (d *daemonServer) applyResize(rows, cols int) error {
 	if err := d.resizePTY(rows, cols); err != nil {
 		return err
 	}
 	return d.notifyWindowChange()
+}
+
+func (d *daemonServer) currentPTYSize() (rows, cols int, err error) {
+	if d.getPTYSize != nil {
+		return d.getPTYSize()
+	}
+	return pty.Getsize(d.ptmx)
 }
 
 func (d *daemonServer) resizePTY(rows, cols int) error {
@@ -574,7 +650,7 @@ func (d *daemonServer) notifyWindowChange() error {
 		return d.windowChange()
 	}
 
-	processGroupID, err := syscall.Getpgid(d.meta.ShellPID)
+	processGroupID, err := d.foregroundProcessGroupID()
 	if err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			return nil
@@ -582,11 +658,36 @@ func (d *daemonServer) notifyWindowChange() error {
 		return err
 	}
 
-	if err := syscall.Kill(-processGroupID, syscall.SIGWINCH); err != nil && !errors.Is(err, syscall.ESRCH) {
+	if err := d.sendSIGWINCH(processGroupID); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return err
 	}
 
 	return nil
+}
+
+func (d *daemonServer) foregroundProcessGroupID() (int, error) {
+	if d.getPGRP != nil {
+		return d.getPGRP()
+	}
+
+	if d.ptmx != nil {
+		processGroupID, err := unix.IoctlGetInt(int(d.ptmx.Fd()), unix.TIOCGPGRP)
+		if err == nil && processGroupID > 0 {
+			return processGroupID, nil
+		}
+		if err != nil && !errors.Is(err, syscall.ENOTTY) {
+			return 0, err
+		}
+	}
+
+	return syscall.Getpgid(d.meta.ShellPID)
+}
+
+func (d *daemonServer) sendSIGWINCH(processGroupID int) error {
+	if d.signalPGRP != nil {
+		return d.signalPGRP(processGroupID)
+	}
+	return syscall.Kill(-processGroupID, syscall.SIGWINCH)
 }
 
 func (d *daemonServer) releaseClient(conn net.Conn) error {
