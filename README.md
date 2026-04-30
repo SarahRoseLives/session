@@ -100,15 +100,7 @@ It adapts to smaller terminals by switching to a compact layout and trimming lon
 
 ## Demo
 
-An asciinema recording is included in the repo:
-
-- [session.cast](./session.cast)
-
-You can play it locally with:
-
-```bash
-asciinema play session.cast
-```
+![session demo](./session.gif)
 
 ## How it works
 
