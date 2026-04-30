@@ -36,8 +36,10 @@ type daemonServer struct {
 	ptmx       *os.File
 	transcript *os.File
 
-	mu     sync.Mutex
-	client net.Conn
+	mu           sync.Mutex
+	client       net.Conn
+	setPTYSize   func(rows, cols int) error
+	windowChange func() error
 }
 
 func main() {
@@ -521,10 +523,7 @@ func (d *daemonServer) handleClient(conn net.Conn) (err error) {
 				return err
 			}
 
-			if err := pty.Setsize(d.ptmx, &pty.Winsize{
-				Rows: uint16(rows),
-				Cols: uint16(cols),
-			}); err != nil {
+			if err := d.applyResize(rows, cols); err != nil {
 				return err
 			}
 		default:
@@ -549,6 +548,44 @@ func (d *daemonServer) claimClient(conn net.Conn) error {
 	}
 
 	d.client = conn
+	return nil
+}
+
+func (d *daemonServer) applyResize(rows, cols int) error {
+	if err := d.resizePTY(rows, cols); err != nil {
+		return err
+	}
+	return d.notifyWindowChange()
+}
+
+func (d *daemonServer) resizePTY(rows, cols int) error {
+	if d.setPTYSize != nil {
+		return d.setPTYSize(rows, cols)
+	}
+
+	return pty.Setsize(d.ptmx, &pty.Winsize{
+		Rows: uint16(rows),
+		Cols: uint16(cols),
+	})
+}
+
+func (d *daemonServer) notifyWindowChange() error {
+	if d.windowChange != nil {
+		return d.windowChange()
+	}
+
+	processGroupID, err := syscall.Getpgid(d.meta.ShellPID)
+	if err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+
+	if err := syscall.Kill(-processGroupID, syscall.SIGWINCH); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+
 	return nil
 }
 
