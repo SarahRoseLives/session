@@ -15,7 +15,7 @@ Unlike `screen`, this project stays focused on **session persistence and quick r
 - **Persistent shell sessions** backed by a PTY
 - **Resume picker** built with Bubble Tea
 - **Newest-first session list**
-- **Named sessions** with `--session`
+- **Named sessions** with `--name`
 - **Live session details** in the list and resume UI:
   - session name
   - current working directory
@@ -59,7 +59,7 @@ session
 Start a named session:
 
 ```bash
-session --session workbench
+session --name workbench
 ```
 
 List saved sessions:

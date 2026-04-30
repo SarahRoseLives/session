@@ -80,7 +80,7 @@ func parseConfig(args []string) (config, error) {
 	cfg := config{}
 	fs.BoolVar(&cfg.resume, "resume", false, "List saved sessions and reconnect")
 	fs.BoolVar(&cfg.list, "list", false, "List saved sessions")
-	fs.StringVar(&cfg.sessionName, "session", "", "Name a new session")
+	fs.StringVar(&cfg.sessionName, "name", "", "Name a new session")
 	fs.BoolVar(&cfg.daemon, "daemon", false, "")
 	fs.StringVar(&cfg.id, "id", "", "")
 	fs.StringVar(&cfg.shell, "shell", "", "")
@@ -95,11 +95,11 @@ func parseConfig(args []string) (config, error) {
 		return cfg, usageError(errors.New("use either --resume or --list"))
 	}
 	cfg.sessionName = strings.TrimSpace(cfg.sessionName)
-	if cfg.sessionName == "" && hasSessionFlag(args) {
-		return cfg, usageError(errors.New("--session requires a non-empty value"))
+	if cfg.sessionName == "" && hasNameFlag(args) {
+		return cfg, usageError(errors.New("--name requires a non-empty value"))
 	}
 	if cfg.sessionName != "" && (cfg.resume || cfg.list) {
-		return cfg, usageError(errors.New("--session can only be used when creating a new session"))
+		return cfg, usageError(errors.New("--name can only be used when creating a new session"))
 	}
 	if cfg.daemon && cfg.id == "" {
 		return cfg, errors.New("missing session id for daemon mode")
@@ -109,12 +109,12 @@ func parseConfig(args []string) (config, error) {
 }
 
 func usageError(err error) error {
-	return fmt.Errorf("%w\n\nusage:\n  session                    start a new session\n  session --session NAME     start a named session\n  session --resume           list sessions and reconnect\n  session --list             list saved sessions", err)
+	return fmt.Errorf("%w\n\nusage:\n  session                 start a new session\n  session --name NAME     start a named session\n  session --resume        list sessions and reconnect\n  session --list          list saved sessions", err)
 }
 
-func hasSessionFlag(args []string) bool {
+func hasNameFlag(args []string) bool {
 	for _, arg := range args {
-		if arg == "--session" || strings.HasPrefix(arg, "--session=") {
+		if arg == "--name" || strings.HasPrefix(arg, "--name=") {
 			return true
 		}
 	}
@@ -156,7 +156,7 @@ func startDaemon(id, shell, sessionName string) error {
 
 	args := []string{"--daemon", "--id", id, "--shell", shell}
 	if sessionName != "" {
-		args = append(args, "--session", sessionName)
+		args = append(args, "--name", sessionName)
 	}
 	cmd := exec.Command(exe, args...)
 	cmd.Stdin = devNull
