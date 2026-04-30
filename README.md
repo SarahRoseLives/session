@@ -42,7 +42,7 @@ One-line install to `/usr/local/bin`:
 curl -fsSL https://raw.githubusercontent.com/SarahRoseLives/session/main/install.sh | sh
 ```
 
-The installer builds the latest `main` branch and places the binary at `/usr/local/bin/session`. It requires `curl`, `tar`, and `go`. If `/usr/local/bin` is not writable, it will use `sudo`.
+The installer downloads the latest GitHub release binary and places it at `/usr/local/bin/session`. It currently supports **Linux amd64** and **Linux arm64**. If `/usr/local/bin` is not writable, it will use `sudo`.
 
 Build it locally:
 
