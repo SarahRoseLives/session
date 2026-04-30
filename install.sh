@@ -3,6 +3,7 @@
 set -eu
 
 repo_url="https://github.com/SarahRoseLives/session"
+release_api="https://api.github.com/repos/SarahRoseLives/session/releases/latest"
 install_dir="${INSTALL_DIR:-/usr/local/bin}"
 
 require() {
@@ -43,7 +44,15 @@ aarch64|arm64) arch="arm64" ;;
 esac
 
 asset="session_${platform}_${arch}.tar.gz"
-download_url="$repo_url/releases/latest/download/$asset"
+latest_tag="$(
+	curl -fsSL "$release_api" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+)"
+if [ -z "$latest_tag" ]; then
+	echo "session installer: failed to determine latest release tag" >&2
+	exit 1
+fi
+
+download_url="$repo_url/releases/download/$latest_tag/$asset"
 archive="$tmpdir/$asset"
 
 curl -fsSL "$download_url" -o "$archive"
@@ -54,6 +63,8 @@ if [ ! -f "$binary" ]; then
 	echo "session installer: downloaded archive did not contain session binary" >&2
 	exit 1
 fi
+
+echo "installing session $latest_tag"
 
 if [ -w "$install_dir" ]; then
 	install -m 0755 "$binary" "$install_dir/session"
